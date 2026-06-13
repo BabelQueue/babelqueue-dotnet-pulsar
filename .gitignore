@@ -3,3 +3,6 @@ obj/
 *.user
 coverage.cobertura.xml
 artifacts/
+
+# CommitBrief local config and cache
+.commitbrief/
