@@ -24,4 +24,9 @@
     <ProjectReference Include="../../src/BabelQueue.Pulsar/BabelQueue.Pulsar.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Vendored canonical conformance suite (synced from conformance/); copied next to the test assembly. -->
+    <None Include="conformance/**/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="conformance" />
+  </ItemGroup>
+
 </Project>
