@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
+    <!-- Static analysis: Roslyn analyzers at the recommended ruleset, failing the
+         build on any finding. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+
+    <!-- NuGet package metadata -->
+    <PackageId>BabelQueue.Pulsar</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Muhammet Şafak</Authors>
+    <Company>BabelQueue</Company>
+    <Description>Apache Pulsar transport for BabelQueue — a canonical-envelope publisher and a URN-routed consumer over DotPulsar, on the framework-agnostic core.</Description>
+    <PackageProjectUrl>https://babelqueue.com</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/BabelQueue/babelqueue-dotnet-pulsar</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>babelqueue;pulsar;apache-pulsar;dotpulsar;queue;polyglot;messaging</PackageTags>
+    <Copyright>Copyright (c) 2026 Muhammet Şafak</Copyright>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DotPulsar" Version="5.3.1" />
+    <PackageReference Include="BabelQueue.Core" Version="1.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Let the test project assert the internal property projection against the conformance golden. -->
+    <InternalsVisibleTo Include="BabelQueue.Pulsar.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>
