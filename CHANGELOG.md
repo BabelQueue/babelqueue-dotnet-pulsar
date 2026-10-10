@@ -7,6 +7,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+- Optional `OnRoutingMismatch` hook on the consumer options: called with the property URN, the body URN
+  and the envelope when `bq-job` differs from the body's `job`. Defaults to a no-op; a throwing
+  hook is swallowed. New public API, so the next release is a MINOR.
+
+### Fixed
+- `PulsarConsumer` now follows contract §5.2/§5.7: it routes on the `bq-job` message property
+  (the body's `job`/`urn` is only a fallback when the property is absent or blank), and takes
+  `attempts` from the authoritative `bq-attempts` property (falling back to the body's value when
+  it is absent or does not match `^[0-9]+$` — ASCII digits only, no sign or whitespace, within `int`), still raised to `RedeliveryCount` when that is higher. Previously it
+  routed on the decoded body URN and ignored `bq-attempts`. When `bq-job` differs from the body's `job`, the new optional `OnRoutingMismatch` hook is called (property URN, body URN, envelope/message); the property still routes, a throwing hook is swallowed and `OnError` is untouched. No breaking public API or wire-format change (only the optional hook is added).
+
 ## [1.0.0] - 2026-06-13
 
 ### Added

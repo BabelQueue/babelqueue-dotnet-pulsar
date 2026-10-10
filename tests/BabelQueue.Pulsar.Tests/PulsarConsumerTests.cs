@@ -10,7 +10,8 @@ namespace BabelQueue.Pulsar.Tests;
 
 /// <summary>
 /// Consumer behaviour against a mocked Pulsar consumer (no broker): attempts =
-/// max(body, RedeliveryCount), Acknowledge on success, redeliver on failure /
+/// routing on the bq-job property (body fallback), attempts from bq-attempts reconciled with
+/// RedeliveryCount, Acknowledge on success, redeliver on failure /
 /// non-conformant / unmapped URN, and the unknown-URN hooks.
 /// </summary>
 public sealed class PulsarConsumerTests
@@ -34,6 +35,14 @@ public sealed class PulsarConsumerTests
         message.Setup(m => m.Value()).Returns(body);
         message.SetupGet(m => m.RedeliveryCount).Returns((uint)redeliveryCount);
         message.SetupGet(m => m.MessageId).Returns(new MessageId(0, 0, 0, 0, "orders"));
+        return message;
+    }
+
+    private static Mock<IMessage<byte[]>> Message(
+        int redeliveryCount, byte[] body, IReadOnlyDictionary<string, string> properties)
+    {
+        var message = Message(redeliveryCount, body);
+        message.SetupGet(m => m.Properties).Returns(properties);
         return message;
     }
 
@@ -85,6 +94,236 @@ public sealed class PulsarConsumerTests
         var seen = -1;
         await new PulsarConsumer(consumer.Object, Handler(env => seen = env.Attempts)).ReceiveAsync();
         Assert.Equal(5, seen);
+    }
+
+    [Fact]
+    public async Task BqJobPropertyWinsOverBodyUrn()
+    {
+        // Body says orders:created, the bq-job property says orders:refunded: the property routes.
+        const string other = "urn:babel:orders:refunded";
+        var consumer = ConsumerWith(
+            Message(0, Body(), new Dictionary<string, string> { ["bq-job"] = other }).Object);
+        string? routedTo = null;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) =>
+            {
+                routedTo = "body";
+                return Task.CompletedTask;
+            },
+            [other] = (_, _, _) =>
+            {
+                routedTo = "property";
+                return Task.CompletedTask;
+            },
+        };
+
+        await new PulsarConsumer(consumer.Object, handlers).ReceiveAsync();
+
+        Assert.Equal("property", routedTo);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task BqJobPropertyWithoutHandlerIsUnknownEvenIfBodyUrnHasOne()
+    {
+        var consumer = ConsumerWith(Message(
+            0, Body(), new Dictionary<string, string> { ["bq-job"] = "urn:babel:orders:refunded" }).Object);
+        Exception? reported = null;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("must not route on the body"),
+        };
+        var options = new PulsarConsumerOptions { OnError = (e, _, _) => reported = e };
+
+        await new PulsarConsumer(consumer.Object, handlers, options).ReceiveAsync();
+
+        var unknown = Assert.IsType<UnknownUrnException>(reported);
+        Assert.Contains("urn:babel:orders:refunded", unknown.Message);
+        consumer.Verify(
+            c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MissingOrBlankBqJobFallsBackToBodyUrn(bool blank)
+    {
+        var props = blank
+            ? new Dictionary<string, string> { ["bq-job"] = "  " }
+            : new Dictionary<string, string> { ["bq-trace-id"] = "t" };
+        var consumer = ConsumerWith(Message(0, Body(), props).Object);
+        var called = false;
+
+        await new PulsarConsumer(consumer.Object, Handler(_ => called = true)).ReceiveAsync();
+
+        Assert.True(called);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task BqAttemptsPropertyIsAuthoritativeOverBody()
+    {
+        // Body carries 0, the property says 3, the broker redelivered once: property wins over body.
+        var consumer = ConsumerWith(
+            Message(1, Body(), new Dictionary<string, string> { ["bq-attempts"] = "3" }).Object);
+        var seen = -1;
+        await new PulsarConsumer(consumer.Object, Handler(env => seen = env.Attempts)).ReceiveAsync();
+        Assert.Equal(3, seen);
+    }
+
+    [Fact]
+    public async Task BqAttemptsPropertyLowerThanBodyStillWins()
+    {
+        var consumer = ConsumerWith(
+            Message(0, Body(attempts: 5), new Dictionary<string, string> { ["bq-attempts"] = "2" }).Object);
+        var seen = -1;
+        await new PulsarConsumer(consumer.Object, Handler(env => seen = env.Attempts)).ReceiveAsync();
+        Assert.Equal(2, seen);
+    }
+
+    [Fact]
+    public async Task RedeliveryCountRaisesAHigherNativeCountOverBqAttempts()
+    {
+        // A native redelivery does not touch bq-attempts; the higher native count is kept.
+        var consumer = ConsumerWith(
+            Message(4, Body(), new Dictionary<string, string> { ["bq-attempts"] = "1" }).Object);
+        var seen = -1;
+        await new PulsarConsumer(consumer.Object, Handler(env => seen = env.Attempts)).ReceiveAsync();
+        Assert.Equal(4, seen);
+    }
+
+    [Theory]
+    [InlineData("abc")]
+    [InlineData("-1")]
+    [InlineData("")]
+    [InlineData("+3")]
+    [InlineData(" 3")]
+    [InlineData("3 ")]
+    [InlineData("3\n")]
+    [InlineData("\u0663")]
+    [InlineData("99999999999")]
+    public async Task InvalidBqAttemptsFallsBackToBodyAttempts(string bad)
+    {
+        var consumer = ConsumerWith(
+            Message(0, Body(attempts: 5), new Dictionary<string, string> { ["bq-attempts"] = bad }).Object);
+        var seen = -1;
+        await new PulsarConsumer(consumer.Object, Handler(env => seen = env.Attempts)).ReceiveAsync();
+        Assert.Equal(5, seen);
+    }
+
+    [Fact]
+    public async Task BqJobBodyJobMismatchCallsRoutingMismatchHookNotOnError()
+    {
+        const string other = "urn:babel:orders:refunded";
+        var consumer = ConsumerWith(
+            Message(0, Body(), new Dictionary<string, string> { ["bq-job"] = other }).Object);
+        var mismatches = new List<string>();
+        var errors = new List<Exception>();
+        var called = false;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [other] = (_, _, _) =>
+            {
+                called = true;
+                return Task.CompletedTask;
+            },
+        };
+        var options = new PulsarConsumerOptions
+        {
+            OnError = (e, _, _) => errors.Add(e),
+            OnRoutingMismatch = (property, body, _, _) => mismatches.Add($"{property}|{body}"),
+        };
+
+        await new PulsarConsumer(consumer.Object, handlers, options).ReceiveAsync();
+
+        Assert.True(called);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal(new[] { $"{other}|{Urn}" }, mismatches);
+        Assert.Empty(errors);
+    }
+
+    [Fact]
+    public async Task ThrowingRoutingMismatchHookIsSwallowedAndMessageIsAcknowledged()
+    {
+        const string other = "urn:babel:orders:refunded";
+        var consumer = ConsumerWith(
+            Message(0, Body(), new Dictionary<string, string> { ["bq-job"] = other }).Object);
+        var errors = new List<Exception>();
+        var called = false;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [other] = (_, _, _) =>
+            {
+                called = true;
+                return Task.CompletedTask;
+            },
+        };
+        var options = new PulsarConsumerOptions
+        {
+            OnError = (e, _, _) => errors.Add(e),
+            OnRoutingMismatch = (_, _, _, _) => throw new InvalidOperationException("hook boom"),
+        };
+
+        await new PulsarConsumer(consumer.Object, handlers, options).ReceiveAsync();
+
+        Assert.True(called);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+        consumer.Verify(
+            c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        Assert.Empty(errors);
+    }
+
+    [Fact]
+    public async Task MismatchWithoutHookIsSilent()
+    {
+        const string other = "urn:babel:orders:refunded";
+        var consumer = ConsumerWith(
+            Message(0, Body(), new Dictionary<string, string> { ["bq-job"] = other }).Object);
+        var handlers = new Dictionary<string, BabelHandler> { [other] = (_, _, _) => Task.CompletedTask };
+
+        await new PulsarConsumer(consumer.Object, handlers).ReceiveAsync();
+
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task MatchingBqJobDoesNotCallRoutingMismatchHook()
+    {
+        var consumer = ConsumerWith(
+            Message(0, Body(), new Dictionary<string, string> { ["bq-job"] = Urn }).Object);
+        var reported = new List<Exception>();
+        var options = new PulsarConsumerOptions { OnRoutingMismatch = (p, _, _, _) => reported.Add(new InvalidOperationException(p)) };
+
+        await new PulsarConsumer(consumer.Object, Handler(_ => { }), options).ReceiveAsync();
+
+        Assert.Empty(reported);
+    }
+
+    [Fact]
+    public async Task BodyWithoutJobIsRejectedEvenWhenBqJobIsPresent()
+    {
+        const string badBody = "{\"trace_id\":\"t\",\"data\":{\"x\":1},"
+            + "\"meta\":{\"id\":\"m\",\"queue\":\"q\",\"lang\":\"dotnet\",\"schema_version\":1,\"created_at\":1},"
+            + "\"attempts\":0}";
+        var consumer = ConsumerWith(Message(
+            0, Encoding.UTF8.GetBytes(badBody), new Dictionary<string, string> { ["bq-job"] = Urn }).Object);
+        Exception? reported = null;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("must not reach the handler"),
+        };
+        var options = new PulsarConsumerOptions { OnError = (e, _, _) => reported = e };
+
+        await new PulsarConsumer(consumer.Object, handlers, options).ReceiveAsync();
+
+        Assert.IsType<BabelQueueException>(reported);
+        consumer.Verify(
+            c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
