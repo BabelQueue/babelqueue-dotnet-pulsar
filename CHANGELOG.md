@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-10
+
 ### Added
 - Optional `OnRoutingMismatch` hook on the consumer options: called with the property URN, the body URN
   and the envelope when `bq-job` differs from the body's `job`. Defaults to a no-op; a throwing
