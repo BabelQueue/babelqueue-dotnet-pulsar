@@ -14,7 +14,8 @@ public sealed class PulsarConsumerOptions
     /// <summary>
     /// Optional advisory hook (default: none), called with (property URN, body URN, envelope,
     /// message) when the <c>bq-job</c> property that was routed on differs from the body's
-    /// <c>job</c>. Never affects settling; exceptions it throws are swallowed.
+    /// <c>job</c>. Never affects settling; exceptions it throws are swallowed. Do not assign an
+    /// <c>async</c> lambda: as <c>async void</c>, an exception after its first <c>await</c> escapes.
     /// </summary>
     public Action<string, string, Envelope, IMessage<byte[]>>? OnRoutingMismatch { get; set; }
 

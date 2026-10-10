@@ -77,6 +77,11 @@ converge on the same number. A throwing handler redelivers the message
 loop never stops on a bad message — observe via `OnError`/`OnUnknownUrn`. If `bq-job` differs from the body's `job`, the property still routes and the optional `OnRoutingMismatch` hook is called with the property URN, body URN and envelope/message (a throwing hook is swallowed; settling is unaffected; `OnError` is not involved). The envelope is
 unchanged (`schema_version` stays `1`); Pulsar is purely additive.
 
+`OnError` and `OnRoutingMismatch` are synchronous `Action` delegates (`OnUnknownUrn` returns a
+`Task` and may be async). Do not assign an `async` lambda to them: it compiles to `async void`, so an exception thrown after its
+first `await` escapes the consumer's try/catch and can crash the process. Keep hooks
+synchronous, or hand async work off yourself and observe its failures.
+
 ## Build & test
 
 ```bash
