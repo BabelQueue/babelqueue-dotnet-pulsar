@@ -73,4 +73,56 @@ public sealed class PulsarConformanceTests
             Assert.Equal(expected, seen);
         }
     }
+
+    [Fact]
+    public async Task SchemaVersionGateMatchesGolden()
+    {
+        var gate = Pulsar().GetProperty("schema_version_gate");
+        var property = gate.GetProperty("property").GetString()!;
+        var body = File.ReadAllText(Path.Combine(Dir, gate.GetProperty("fixture").GetString()!));
+        var job = EnvelopeCodec.Decode(body).Job!;
+
+        var cases = gate.GetProperty("cases").EnumerateArray().ToList();
+        Assert.NotEmpty(cases);
+        foreach (var testCase in cases)
+        {
+            var absent = testCase.TryGetProperty("absent", out var a) && a.GetBoolean();
+            var value = absent ? null : testCase.GetProperty("value").GetString();
+            var expect = testCase.GetProperty("expect").GetString();
+
+            var properties = new Dictionary<string, string>();
+            if (!absent)
+            {
+                properties[property] = value!;
+            }
+
+            var message = new Mock<IMessage<byte[]>>();
+            message.Setup(m => m.Value()).Returns(Encoding.UTF8.GetBytes(body));
+            message.SetupGet(m => m.Properties).Returns(properties);
+            message.SetupGet(m => m.RedeliveryCount).Returns(0u);
+            message.SetupGet(m => m.MessageId).Returns(new MessageId(0, 0, 0, 0, "orders"));
+
+            var consumer = new Mock<IConsumer<byte[]>>();
+            consumer.Setup(c => c.Receive(It.IsAny<CancellationToken>()))
+                .Returns(new ValueTask<IMessage<byte[]>>(message.Object));
+
+            var seen = 0;
+            var handlers = new Dictionary<string, BabelHandler>
+            {
+                [job] = (_, _, _) => { seen++; return Task.CompletedTask; },
+            };
+            await new PulsarConsumer(consumer.Object, handlers).ReceiveAsync();
+
+            var label = absent ? "<absent>" : $"'{value}'";
+            Assert.True(
+                (expect == "decode" ? 1 : 0) == seen,
+                $"{label}: expected {expect} but handler ran {seen} time(s)");
+            consumer.Verify(
+                c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()),
+                expect == "decode" ? Times.Once() : Times.Never());
+            consumer.Verify(
+                c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+                expect == "decode" ? Times.Never() : Times.Once());
+        }
+    }
 }
