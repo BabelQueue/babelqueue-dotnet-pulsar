@@ -15,6 +15,13 @@ The envelope wire format is versioned separately by `meta.schema_version`
   hook is swallowed. New public API, so the next release is a MINOR.
 
 ### Fixed
+- `PulsarConsumer` now version-gates on the `bq-schema-version` message property **before** decoding
+  the body (§5.7 step 3, MUST). A present value that is not exactly the core's supported schema version
+  (`EnvelopeCodec.SchemaVersion`; compared exactly as sent, with no trimming; so `"2"`, `"x"`, `"01"` and `" 1"` are rejected) skips decoding and routing:
+  `OnError` receives a `BabelQueueException` naming the property (with an empty envelope) and the
+  message is redelivered, like a non-conformant envelope. A missing/blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR; NBSP, U+0085, U+FEFF etc. are not blank) property and a supported
+  value behave as before (the post-decode `Accepts` check is unchanged). No public API or wire change;
+  `schema_version` stays 1.
 - `PulsarConsumer` now follows contract §5.2/§5.7: it routes on the `bq-job` message property
   (the body's `job`/`urn` is only a fallback when the property is absent or blank), and takes
   `attempts` from the authoritative `bq-attempts` property (falling back to the body's value when

@@ -51,6 +51,12 @@ Delayed delivery: `PublishAsync(urn, data, traceId, TimeSpan.FromMinutes(5))` �
 `job`/`urn` is consulted only when the property is absent or blank (a message produced
 outside BabelQueue).
 
+Before decoding the body, the consumer version-gates on the `bq-schema-version` property
+(§5.7 step 3): a value that is not exactly the schema version the core supports, compared exactly as sent with no
+trimming (`"2"`, `"x"`, `"01"`, `" 1"`, …) is rejected without decoding — `OnError` is called with an empty envelope and the
+message is redelivered, the same path as a non-conformant envelope. A missing or blank (empty or
+ASCII-whitespace-only: space, tab, LF, VT, FF, CR; NBSP, U+0085, U+FEFF etc. are not blank) property changes nothing; a `"1"` property still goes through the post-decode `Accepts` check.
+
 ## Contract mapping (§5)
 
 | Envelope | Apache Pulsar |

@@ -17,11 +17,21 @@ namespace BabelQueue.Pulsar;
 /// the body's <c>job</c> differ, the property still routes and the optional <c>OnRoutingMismatch</c>
 /// hook is notified (a throwing hook is swallowed; the message is settled normally). The loop
 /// never stops on a bad message — observe via the option hooks.
+/// <para>
+/// Per §5.7 step 3 the <c>bq-schema-version</c> property is checked <b>before</b> the body is
+/// decoded: when it is present and is not exactly the schema version the core supports
+/// (<see cref="EnvelopeCodec.SchemaVersion"/>, compared exactly as sent, as its canonical decimal string, with no
+/// trimming — so <c>"2"</c>, <c>"x"</c>, <c>"01"</c> and <c>" 1"</c> are all unknown), the body is never decoded or routed;
+/// <c>OnError</c> is notified (with an empty, undecoded envelope) and the message is redelivered, the
+/// same settle path as a non-conformant envelope. A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR) property changes nothing, and a
+/// <c>"1"</c> property still goes through the post-decode <see cref="EnvelopeCodec.Accepts"/> check.
+/// </para>
 /// </summary>
 public sealed class PulsarConsumer
 {
     private const string JobProperty = "bq-job";
     private const string AttemptsProperty = "bq-attempts";
+    private const string SchemaVersionProperty = "bq-schema-version";
 
     private readonly IConsumer<byte[]> _consumer;
     private readonly IReadOnlyDictionary<string, BabelHandler> _handlers;
@@ -65,6 +75,27 @@ public sealed class PulsarConsumer
     private async Task HandleAsync(IMessage<byte[]> message, CancellationToken cancellationToken)
     {
         var properties = message.Properties;
+
+        // §5.7 step 3: version-gate on the property before decoding the body.
+        // The value is compared exactly as sent (no trimming), like the Go/Python/Node consumers (GR-5).
+        var declaredVersion = RawProperty(properties, SchemaVersionProperty);
+        if (declaredVersion is not null && !IsBlankSchemaVersion(declaredVersion)
+            && !string.Equals(
+                declaredVersion,
+                EnvelopeCodec.SchemaVersion.ToString(CultureInfo.InvariantCulture),
+                StringComparison.Ordinal))
+        {
+            // The body is deliberately not decoded, so hand OnError an empty envelope.
+            _options.OnError?.Invoke(
+                new BabelQueueException(
+                    $"Rejected a Pulsar message: unsupported {SchemaVersionProperty} property '{declaredVersion}' "
+                    + $"(supported: {EnvelopeCodec.SchemaVersion}); body not decoded."),
+                new Envelope(null, null, null, null, 0, null),
+                message);
+            await RedeliverAsync(message, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         var envelope = Reconcile(
             EnvelopeCodec.Decode(Encoding.UTF8.GetString(message.Value())),
             RawProperty(properties, AttemptsProperty),
@@ -154,6 +185,24 @@ public sealed class PulsarConsumer
     /// <summary>The property value exactly as sent (no trimming), or <c>null</c> when the map or the key is missing.</summary>
     private static string? RawProperty(IReadOnlyDictionary<string, string>? properties, string key)
         => properties is not null && properties.TryGetValue(key, out var value) ? value : null;
+
+    /// <summary>
+    /// The shared cross-SDK "blank" definition for <c>bq-schema-version</c>: the empty string, or a value made up
+    /// <b>only</b> of ASCII whitespace (space, <c>\t</c>, <c>\n</c>, U+000B, <c>\f</c>, <c>\r</c>). Anything else
+    /// (NBSP, U+001C–U+001F, U+0085, U+FEFF, …) is <b>not</b> blank, unlike <see cref="string.IsNullOrWhiteSpace"/>.
+    /// </summary>
+    private static bool IsBlankSchemaVersion(string value)
+    {
+        foreach (var c in value)
+        {
+            if (c != ' ' && (c < '\t' || c > '\r'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     /// <summary><c>^[0-9]+$</c>: ASCII digits only — no sign, no whitespace, not empty, no Unicode digits.</summary>
     private static bool IsAsciiDigits(string? value)

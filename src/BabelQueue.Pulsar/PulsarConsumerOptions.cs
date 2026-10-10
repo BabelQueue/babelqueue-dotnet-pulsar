@@ -7,7 +7,9 @@ public sealed class PulsarConsumerOptions
 {
     /// <summary>
     /// Called for a non-conformant envelope, an unmapped URN (with no
-    /// <see cref="OnUnknownUrn"/>), or a throwing handler. The poll loop never stops.
+    /// <see cref="OnUnknownUrn"/>), a throwing handler, or a message whose
+    /// <c>bq-schema-version</c> property names an unsupported version (rejected before the body is
+    /// decoded; the envelope argument is then empty). The poll loop never stops.
     /// </summary>
     public Action<Exception, Envelope, IMessage<byte[]>>? OnError { get; set; }
 

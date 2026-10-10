@@ -401,6 +401,138 @@ public sealed class PulsarConsumerTests
     }
 
     [Fact]
+    public async Task MissingSchemaVersionPropertyDecodesAndDelivers()
+    {
+        var message = Message(0, Body(), new Dictionary<string, string> { ["bq-job"] = Urn });
+        var consumer = ConsumerWith(message.Object);
+        var delivered = 0;
+
+        await new PulsarConsumer(consumer.Object, Handler(_ => delivered++)).ReceiveAsync();
+
+        Assert.Equal(1, delivered);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("  ")]
+    [InlineData("\t")]
+    [InlineData("\u000B")]
+    [InlineData("\f")]
+    [InlineData("\n")]
+    [InlineData("\r")]
+    public async Task BlankSchemaVersionPropertyDecodesAndDelivers(string blank)
+    {
+        // A blank property is treated like a missing one (same rule as Go/Python/Node): not gated.
+        var message = Message(
+            0, Body(), new Dictionary<string, string> { ["bq-job"] = Urn, ["bq-schema-version"] = blank });
+        var consumer = ConsumerWith(message.Object);
+        var delivered = 0;
+
+        await new PulsarConsumer(consumer.Object, Handler(_ => delivered++)).ReceiveAsync();
+
+        Assert.Equal(1, delivered);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task SupportedSchemaVersionPropertyDelivers()
+    {
+        var message = Message(
+            0, Body(), new Dictionary<string, string> { ["bq-schema-version"] = EnvelopeCodec.SchemaVersion.ToString() });
+        var consumer = ConsumerWith(message.Object);
+        var delivered = 0;
+
+        await new PulsarConsumer(consumer.Object, Handler(_ => delivered++)).ReceiveAsync();
+
+        Assert.Equal(1, delivered);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData("2")]
+    [InlineData("x")]
+    [InlineData("01")]
+    [InlineData("1.0")]
+    [InlineData("-1")]
+    [InlineData(" 1")]
+    [InlineData("1 ")]
+    [InlineData("\t1")]
+    [InlineData("\u00A0")]
+    [InlineData("\u001C")]
+    [InlineData("\u0085")]
+    [InlineData("\uFEFF")]
+    public async Task UnknownSchemaVersionPropertyIsRejectedBeforeDecoding(string version)
+    {
+        // The body is invalid JSON: if it were decoded the failure would be the generic
+        // non-conformant-envelope rejection, not the version-gate message.
+        var message = Message(
+            0, Encoding.UTF8.GetBytes("{ this is not json"),
+            new Dictionary<string, string> { ["bq-schema-version"] = version });
+        var consumer = ConsumerWith(message.Object);
+        Exception? reported = null;
+        Envelope? reportedEnvelope = null;
+        var delivered = 0;
+        var options = new PulsarConsumerOptions
+        {
+            OnError = (e, env, _) =>
+            {
+                reported = e;
+                reportedEnvelope = env;
+            },
+        };
+
+        await new PulsarConsumer(consumer.Object, Handler(_ => delivered++), options).ReceiveAsync();
+
+        Assert.Equal(0, delivered);
+        Assert.IsType<BabelQueueException>(reported);
+        Assert.Contains("bq-schema-version", reported!.Message);
+        Assert.Contains($"'{version}'", reported.Message);
+        Assert.Null(reportedEnvelope!.Job);
+        message.Verify(m => m.Value(), Times.Never);
+        consumer.Verify(
+            c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task UnknownSchemaVersionWithValidBodyIsStillRejectedAndNeverRouted()
+    {
+        var message = Message(
+            0, Body(), new Dictionary<string, string> { ["bq-job"] = Urn, ["bq-schema-version"] = "2" });
+        var consumer = ConsumerWith(message.Object);
+        var delivered = 0;
+
+        await new PulsarConsumer(consumer.Object, Handler(_ => delivered++)).ReceiveAsync();
+
+        Assert.Equal(0, delivered);
+        consumer.Verify(
+            c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task SupportedSchemaVersionPropertyStillRunsPostDecodeAccepts()
+    {
+        // Property says "1" but the body is not a conformant envelope: Accepts still rejects it.
+        var message = Message(
+            0, Encoding.UTF8.GetBytes("{ this is not json"),
+            new Dictionary<string, string> { ["bq-schema-version"] = "1" });
+        var consumer = ConsumerWith(message.Object);
+        Exception? reported = null;
+        var options = new PulsarConsumerOptions { OnError = (e, _, _) => reported = e };
+
+        await new PulsarConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), options).ReceiveAsync();
+
+        Assert.IsType<BabelQueueException>(reported);
+        Assert.Contains("non-conformant", reported!.Message);
+        consumer.Verify(
+            c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
     public async Task RunStopsWhenCancelled()
     {
         var consumer = new Mock<IConsumer<byte[]>>();
