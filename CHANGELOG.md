@@ -9,6 +9,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+
+- Vendored conformance suite updated to v1.6.0 (tests only; no source or wire change, `schema_version` stays 1).
+- CI pins the `fetch.sh` it downloads by sha256 (`BQ_FETCH_SH_SHA256`) before running it.
+
 ## [1.1.0] - 2026-10-10
 
 ### Added
