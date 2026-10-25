@@ -33,7 +33,7 @@
 
   <ItemGroup>
     <PackageReference Include="DotPulsar" Version="5.3.1" />
-    <PackageReference Include="BabelQueue.Core" Version="1.0.0" />
+    <PackageReference Include="BabelQueue.Core" Version="1.13.0" />
   </ItemGroup>
 
   <ItemGroup>

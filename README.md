@@ -54,7 +54,7 @@ outside BabelQueue).
 Before decoding the body, the consumer version-gates on the `bq-schema-version` property
 (§5.7 step 3): a value that is not exactly the schema version the core supports, compared exactly as sent with no
 trimming (`"2"`, `"x"`, `"01"`, `" 1"`, …) is rejected without decoding — `OnError` is called with an empty envelope and the
-message is redelivered, the same path as a non-conformant envelope. A missing or blank (empty or
+message takes the poison route (below). A missing or blank (empty or
 ASCII-whitespace-only: space, tab, LF, VT, FF, CR; NBSP, U+0085, U+FEFF etc. are not blank) property changes nothing; a `"1"` property still goes through the post-decode `Accepts` check.
 
 ## Contract mapping (§5)
@@ -69,7 +69,7 @@ ASCII-whitespace-only: space, tab, LF, VT, FF, CR; NBSP, U+0085, U+FEFF etc. are
 | `meta.lang` | property `bq-source-lang` |
 | `meta.created_at` | `PublishTime` (mirror; body authoritative) |
 | `attempts` | property `bq-attempts` (authoritative), cross-checked against `RedeliveryCount` |
-| reserve / ack / retry | `Acknowledge` / redeliver-unacknowledged |
+| reserve / ack / retry | `Acknowledge` / re-publish with `bq-attempts` + 1 (`Client` / `RetryProducer`) or redeliver-unacknowledged (Shared / Key_Shared) |
 
 Pulsar properties are string→string, so `bq-attempts` carries the contract `attempts` and is
 **authoritative**. The consumer reads it (falling back to the body's `attempts` when it is
@@ -77,11 +77,45 @@ absent or does not match `^[0-9]+$` — ASCII digits only, no sign/whitespace, w
 `RedeliveryCount` is 0-based (0 on first delivery) so it maps directly to `attempts` with
 **no −1**, and the `max` never lowers a higher carried-over count — so a republish-driven retry
 (the Go/Python transports increment `bq-attempts` and re-send) and a native redelivery both
-converge on the same number. A throwing handler redelivers the message
-(`RedeliverUnacknowledgedMessages`), so the broker re-sends it (at-least-once); with a native
-`DeadLetterPolicy` it eventually moves to the cross-language `<queue>.dlq` topic. The poll
-loop never stops on a bad message — observe via `OnError`/`OnUnknownUrn`. If `bq-job` differs from the body's `job`, the property still routes and the optional `OnRoutingMismatch` hook is called with the property URN, body URN and envelope/message (a throwing hook is swallowed; settling is unaffected; `OnError` is not involved). The envelope is
+converge on the same number. The poll loop never stops on a bad message — observe via `OnError`/`OnUnknownUrn`.
+If `bq-job` differs from the body's `job`, the property still routes and the optional `OnRoutingMismatch` hook is called with the property URN, body URN and envelope/message (a throwing hook is swallowed; settling is unaffected; `OnError` is not involved). The envelope is
 unchanged (`schema_version` stays `1`); Pulsar is purely additive.
+
+## Retries, dead-lettering and poison (ADR-0036)
+
+Pulsar has no broker-side redelivery limit and this SDK sets no native `DeadLetterPolicy`, so the bound is owned by the
+consumer:
+
+```csharp
+await using var dlq = client.NewProducer(Schema.ByteArray).Topic("orders.dlq").Create();
+
+await using var babel = new PulsarConsumer(consumer, handlers, new PulsarConsumerOptions
+{
+    MaxAttempts = 3,             // default: the total number of deliveries, the first included (1 = no retry)
+    DeadLetterProducer = dlq,    // on: exhausted messages go to <queue>.dlq; off (null): they are acknowledged and dropped
+    Client = client,             // the consumer creates its retry producer (re-publish with bq-attempts + 1) from it
+});
+```
+
+- A handler that throws, an unmapped URN with no `OnUnknownUrn` hook, and a poison body while dead-lettering is off are
+  retried while `counted < MaxAttempts` (`counted` = the reconciled `attempts` + 1). Afterwards the message is dead-lettered
+  (`DeadLetterProducer` set: the envelope plus a `dead_letter` block, `reason` `failed` or `unknown_urn`,
+  `dead_letter.attempts` = `counted`) or acknowledged and dropped (a `Trace` warning). **Behaviour change:** before, such a
+  message was redelivered forever; with the defaults it is now dropped after its third delivery.
+- A retry is a re-publish to the consumer's own topic with `bq-attempts` + 1 and an acknowledgement, so the count travels
+  with the message and the bound holds on **every** subscription type. Give the consumer the `Client` it was built from
+  (`PulsarConsumerOptions.Client`) and it creates that retry producer itself on `consumer.Topic` (single topic; disposed by
+  `PulsarConsumer.DisposeAsync`), or pass your own `RetryProducer` (used as given, never disposed by the consumer).
+- With neither, a retry is a negative acknowledgement (`RedeliverUnacknowledgedMessages`), which advances `RedeliveryCount`
+  on Shared and Key_Shared subscriptions only. On an **Exclusive** or **Failover** subscription it would never reach
+  `MaxAttempts`, so the `PulsarConsumer` constructor throws `InvalidOperationException` instead: set `Client` or
+  `RetryProducer` there.
+- **Poison.** A body that cannot reach a handler — invalid UTF-8, not a JSON object, an object without a valid `job`/`urn`,
+  any other non-conformant envelope, or a rejected `bq-schema-version` — is never handed to one. With a
+  `DeadLetterProducer` it is written to `<queue>.dlq` as the ADR-0035 record (`reason: "poison"`,
+  original bytes preserved) and acknowledged, without a retry; without one it takes the bounded retry above and is dropped.
+- The original message is acknowledged only after the dead-letter write (or the retry re-publish) succeeded; a failed
+  write leaves it for redelivery and is reported to `OnError`.
 
 `OnError` and `OnRoutingMismatch` are synchronous `Action` delegates (`OnUnknownUrn` returns a
 `Task` and may be async). Do not assign an `async` lambda to them: it compiles to `async void`, so an exception thrown after its
@@ -95,7 +129,8 @@ dotnet test
 ```
 
 The DotPulsar `IProducer` / `IConsumer` / `IMessage` interfaces are mocked with Moq — no
-Pulsar, no network. xUnit; analyzers run as errors; ≥90% line coverage enforced.
+Pulsar, no network. The vendored conformance suite (v1.7.0) is run too; set `BQ_CONFORMANCE_RESULTS=/path/results.json` to
+get the `results.json` of the run. xUnit; analyzers run as errors; ≥90% line coverage enforced.
 
 ## License
 
