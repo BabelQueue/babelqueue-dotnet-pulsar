@@ -9,8 +9,8 @@ public sealed class PulsarConsumerOptions
     public const int DefaultMaxAttempts = 3;
 
     /// <summary>
-    /// Called for a poison body (a non-conformant envelope, an undecodable body, or a message whose
-    /// <c>bq-schema-version</c> property names an unsupported version), an unmapped URN (with no
+    /// Called for a poison body (a non-conformant envelope or an undecodable body), a message whose
+    /// <c>bq-schema-version</c> property names an unsupported version (ADR-0037), an unmapped URN (with no
     /// <see cref="OnUnknownUrn"/>), or a throwing handler, once per failed delivery, after the message has been
     /// settled. For a rejected message the envelope argument is the decoded one (empty when the body could not be
     /// decoded or was deliberately not decoded). A failed <see cref="DeadLetterProducer"/> write is reported here too
@@ -51,7 +51,9 @@ public sealed class PulsarConsumerOptions
     /// canonical envelope plus the additive <c>dead_letter</c> block (<c>reason</c> <c>failed</c> or
     /// <c>unknown_urn</c>, <c>attempts</c> = the counted attempt), and a poison body is written in the ADR-0035 shape
     /// (<c>reason: "poison"</c>, original bytes preserved) without any retry. The original message is acknowledged only
-    /// after the write succeeded; a failed write leaves it for redelivery.
+    /// after the write succeeded; a failed write leaves it for redelivery. A message whose <c>bq-schema-version</c> property
+    /// names an unsupported version (ADR-0037 decision 1) is written <b>raw</b> (the incoming body byte for byte, no
+    /// <c>dead_letter</c> block) on its first delivery; with this producer unset it is acknowledged and dropped.
     /// </summary>
     public IProducer<byte[]>? DeadLetterProducer { get; set; }
 

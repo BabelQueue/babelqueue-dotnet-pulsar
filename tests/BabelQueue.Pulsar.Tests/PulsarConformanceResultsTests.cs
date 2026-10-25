@@ -9,7 +9,7 @@ namespace BabelQueue.Pulsar.Tests;
 /// </summary>
 public sealed class PulsarConformanceResultsTests
 {
-    private static readonly string[] ExpectedSections = { "poison_dlq", "pulsar", "pulsar_exhaustion" };
+    private static readonly string[] ExpectedSections = { "poison_dlq", "pulsar", "pulsar_exhaustion", "version_gate_pulsar" };
 
     [Fact]
     public async Task ResultsHaveNoFailuresAndAreWrittenOnRequest()
@@ -60,6 +60,18 @@ public sealed class PulsarConformanceResultsTests
     }
 
     [Fact]
+    public async Task OnlyTheStrategyRowsOfVersionGatePulsarAreSkipped()
+    {
+        using var doc = JsonDocument.Parse(await PulsarConformanceSuite.WriteResultsAsync(null));
+        var gate = doc.RootElement.GetProperty("sections").GetProperty("version_gate_pulsar");
+
+        var skipped = gate.EnumerateObject().Where(c => c.Value.GetProperty("status").GetString() == "skip").ToList();
+        Assert.Equal(9, skipped.Count);
+        Assert.All(skipped, c => Assert.Contains("ADR-0037", c.Value.GetProperty("reason").GetString(), StringComparison.Ordinal));
+        Assert.Equal(8, gate.EnumerateObject().Count(c => c.Value.GetProperty("status").GetString() == "pass"));
+    }
+
+    [Fact]
     public void EveryInScopeSectionIsEnumeratedWithUniqueIds()
     {
         var cases = PulsarConformanceSuite.All();
@@ -69,6 +81,7 @@ public sealed class PulsarConformanceResultsTests
         Assert.Contains(cases, c => c is { Section: "pulsar", Id: "schema_version_gate/0" });
         Assert.Contains(cases, c => c is { Section: "pulsar", Id: "attempts_reconciliation/first-delivery" });
         Assert.Equal(29, cases.Count(c => c.Section == "pulsar_exhaustion"));
+        Assert.Equal(17, cases.Count(c => c.Section == "version_gate_pulsar"));
         Assert.Equal(43, cases.Count(c => c.Section == "poison_dlq"));
         Assert.Contains(cases, c => c is { Section: "poison_dlq", Id: "invalid-utf8-one-byte-two-pad" });
     }

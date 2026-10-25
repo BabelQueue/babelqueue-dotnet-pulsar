@@ -54,7 +54,10 @@ outside BabelQueue).
 Before decoding the body, the consumer version-gates on the `bq-schema-version` property
 (§5.7 step 3): a value that is not exactly the schema version the core supports, compared exactly as sent with no
 trimming (`"2"`, `"x"`, `"01"`, `" 1"`, …) is rejected without decoding — `OnError` is called with an empty envelope and the
-message takes the poison route (below). A missing or blank (empty or
+message is settled on its **first delivery** (ADR-0037): with a `DeadLetterProducer` its body is written **exactly as
+received** (byte for byte, no `dead_letter` block) to `<queue>.dlq` and acknowledged after the write (a failed write leaves it
+unacknowledged — negative acknowledgement — and is reported); without one it is acknowledged and dropped (a `Trace`
+warning). It is never retried and never reaches a handler or `OnUnknownUrn`. A missing or blank (empty or
 ASCII-whitespace-only: space, tab, LF, VT, FF, CR; NBSP, U+0085, U+FEFF etc. are not blank) property changes nothing; a `"1"` property still goes through the post-decode `Accepts` check.
 
 ## Contract mapping (§5)
@@ -111,7 +114,7 @@ await using var babel = new PulsarConsumer(consumer, handlers, new PulsarConsume
   `MaxAttempts`, so the `PulsarConsumer` constructor throws `InvalidOperationException` instead: set `Client` or
   `RetryProducer` there.
 - **Poison.** A body that cannot reach a handler — invalid UTF-8, not a JSON object, an object without a valid `job`/`urn`,
-  any other non-conformant envelope, or a rejected `bq-schema-version` — is never handed to one. With a
+  any other non-conformant envelope — is never handed to one (a rejected `bq-schema-version` is not poison: see above). With a
   `DeadLetterProducer` it is written to `<queue>.dlq` as the ADR-0035 record (`reason: "poison"`,
   original bytes preserved) and acknowledged, without a retry; without one it takes the bounded retry above and is dropped.
 - The original message is acknowledged only after the dead-letter write (or the retry re-publish) succeeded; a failed
@@ -129,7 +132,7 @@ dotnet test
 ```
 
 The DotPulsar `IProducer` / `IConsumer` / `IMessage` interfaces are mocked with Moq — no
-Pulsar, no network. The vendored conformance suite (v1.7.0) is run too; set `BQ_CONFORMANCE_RESULTS=/path/results.json` to
+Pulsar, no network. The vendored conformance suite (v1.8.0) is run too; set `BQ_CONFORMANCE_RESULTS=/path/results.json` to
 get the `results.json` of the run. xUnit; analyzers run as errors; ≥90% line coverage enforced.
 
 ## License

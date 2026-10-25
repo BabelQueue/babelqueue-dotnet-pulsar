@@ -9,6 +9,24 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements ADR-0037 decision 1 (version-gate parity, broker-bindings §5.7). The envelope stays at `schema_version: 1`;
+every change is a consumer-side settle decision. Ships as a **MINOR**.
+
+### Changed
+
+- **Behaviour change: a `bq-schema-version`-gated message is settled on its first delivery.** Before, it took the
+  bounded ADR-0036 poison route (a bounded retry while dead-lettering was off, the ADR-0035 poison record while it was on),
+  spending up to `MaxAttempts` deliveries on a message that can never succeed. Now it is never decoded, never retried and
+  never handed to a handler or the `OnUnknownUrn` hook, whatever `bq-attempts`, `RedeliveryCount` or `MaxAttempts` say:
+  with a `DeadLetterProducer` its body is written **exactly as received** (no `dead_letter` block, no ADR-0035 wrapping)
+  to `<queue>.dlq` and acknowledged after the write; a failed write leaves it unacknowledged (negative acknowledgement)
+  and is reported; without a `DeadLetterProducer` it is acknowledged and dropped (a `Trace` warning). This consumer has no
+  unknown-URN strategy option, so it behaves as `fail` (ADR-0037 "Strategy"). ADR-0036 `MaxAttempts` / retry rules for
+  handler failures, unknown URNs and poison bodies are unchanged.
+- Vendored conformance suite updated to v1.8.0; CI pins v1.8.0. The runner covers the new `version_gate_pulsar` section
+  (rows with an `on_unknown_urn` value other than `fail` are reported as `skip` citing ADR-0037: the consumer has no
+  strategy option).
+
 ## [1.2.0] - 2026-10-25
 
 Implements ADR-0036 decisions 1, 2 and 4 (post-R1 parity). The envelope stays at `schema_version: 1`; every change is a

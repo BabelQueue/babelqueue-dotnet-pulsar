@@ -117,12 +117,12 @@ public sealed class PulsarConformanceTests
             Assert.True(
                 (expect == "decode" ? 1 : 0) == seen,
                 $"{label}: expected {expect} but handler ran {seen} time(s)");
-            consumer.Verify(
-                c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()),
-                expect == "decode" ? Times.Once() : Times.Never());
+            // "decode": handled and acknowledged. Anything else is version-gated (ADR-0037): with dead-lettering off it is
+            // acknowledged and dropped on its first delivery; it is never redelivered.
+            consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once());
             consumer.Verify(
                 c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
-                expect == "decode" ? Times.Never() : Times.Once());
+                Times.Never());
         }
     }
 }
