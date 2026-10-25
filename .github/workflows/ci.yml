@@ -28,14 +28,25 @@ jobs:
 
       # The xUnit suite runs against Moq-mocked DotPulsar IProducer/IConsumer/IMessage —
       # no Pulsar, no network.
+      # The conformance runner also writes results.json (ADR-0032) to BQ_CONFORMANCE_RESULTS.
       - name: Test with coverage gate (>=90% line)
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
         run: dotnet test -c Release /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura /p:Threshold=90 /p:ThresholdType=line /p:ThresholdStat=total
+
+      - name: Upload conformance results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: ${{ runner.temp }}/results.json
+          if-no-files-found: warn
 
   conformance:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
     env:
-      BQ_CONFORMANCE_VERSION: 1.6.0
+      BQ_CONFORMANCE_VERSION: 1.7.0
       # sha256 of that release's fetch.sh: the script runs on the runner, so it is pinned rather
       # than trusted from a mutable tag. Bump together with BQ_CONFORMANCE_VERSION.
       BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849

@@ -48,7 +48,7 @@ public sealed class PulsarConsumerTests
 
     private static Mock<IConsumer<byte[]>> ConsumerWith(IMessage<byte[]> message)
     {
-        var consumer = new Mock<IConsumer<byte[]>>();
+        var consumer = TestConsumers.Shared();
         consumer.Setup(c => c.Receive(It.IsAny<CancellationToken>()))
             .Returns(new ValueTask<IMessage<byte[]>>(message));
         return consumer;
@@ -535,7 +535,7 @@ public sealed class PulsarConsumerTests
     [Fact]
     public async Task RunStopsWhenCancelled()
     {
-        var consumer = new Mock<IConsumer<byte[]>>();
+        var consumer = TestConsumers.Shared();
         using var cts = new CancellationTokenSource();
         await cts.CancelAsync();
 
@@ -547,7 +547,7 @@ public sealed class PulsarConsumerTests
     [Fact]
     public async Task RunBreaksWhenReceiveIsCancelled()
     {
-        var consumer = new Mock<IConsumer<byte[]>>();
+        var consumer = TestConsumers.Shared();
         consumer.Setup(c => c.Receive(It.IsAny<CancellationToken>())).Throws(new OperationCanceledException());
 
         await new PulsarConsumer(consumer.Object, new Dictionary<string, BabelHandler>()).RunAsync(CancellationToken.None);

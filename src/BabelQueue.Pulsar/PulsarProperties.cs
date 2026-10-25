@@ -29,6 +29,12 @@ internal static class PulsarProperties
         return props;
     }
 
+    /// <summary>A copy of a received message's properties (empty when the message has none); used for a poison dead-letter record, whose body is not an envelope to project.</summary>
+    public static IReadOnlyDictionary<string, string> Copy(IReadOnlyDictionary<string, string>? properties)
+        => properties is null
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : new Dictionary<string, string>(properties, StringComparer.Ordinal);
+
     private static void Put(Dictionary<string, string> props, string key, string? value)
     {
         if (!string.IsNullOrEmpty(value))

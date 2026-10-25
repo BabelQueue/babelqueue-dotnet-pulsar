@@ -59,7 +59,7 @@ public sealed class PulsarConformanceTests
             message.SetupGet(m => m.RedeliveryCount).Returns(redeliveryCount);
             message.SetupGet(m => m.MessageId).Returns(new MessageId(0, 0, 0, 0, "orders"));
 
-            var consumer = new Mock<IConsumer<byte[]>>();
+            var consumer = TestConsumers.Shared();
             consumer.Setup(c => c.Receive(It.IsAny<CancellationToken>()))
                 .Returns(new ValueTask<IMessage<byte[]>>(message.Object));
 
@@ -102,7 +102,7 @@ public sealed class PulsarConformanceTests
             message.SetupGet(m => m.RedeliveryCount).Returns(0u);
             message.SetupGet(m => m.MessageId).Returns(new MessageId(0, 0, 0, 0, "orders"));
 
-            var consumer = new Mock<IConsumer<byte[]>>();
+            var consumer = TestConsumers.Shared();
             consumer.Setup(c => c.Receive(It.IsAny<CancellationToken>()))
                 .Returns(new ValueTask<IMessage<byte[]>>(message.Object));
 
