@@ -624,8 +624,9 @@ public sealed class PulsarSettleTests
     }
 
     [Fact]
-    public async Task UnsupportedSchemaVersionPropertyTakesThePoisonRouteAndKeepsTheOriginalBytes()
+    public async Task UnsupportedSchemaVersionPropertyIsWrittenRawWithoutADeadLetterBlock()
     {
+        // ADR-0037 decision 1 rule 4: the incoming body exactly as received -- no ADR-0035 record, no dead_letter block.
         var body = Body();
         var sent = new List<Sent>();
         var consumer = ConsumerWith(Message(body, 0, new Dictionary<string, string>
@@ -642,12 +643,40 @@ public sealed class PulsarSettleTests
 
         Assert.Equal(0, handled);
         var record = Assert.Single(sent);
-        Assert.Equal("poison", record.DeadLetter.GetProperty("reason").GetString());
+        Assert.Equal(body, record.Payload);
+        Assert.False(record.Json.TryGetProperty("dead_letter", out _));
         Assert.Equal("2", record.Metadata["bq-schema-version"]);
-        // The original object is spliced byte for byte (only dead_letter is appended).
-        var original = Encoding.UTF8.GetString(body);
-        Assert.StartsWith(original[..^1], Encoding.UTF8.GetString(record.Payload), StringComparison.Ordinal);
         VerifyAcked(consumer, Times.Once());
+    }
+
+    [Fact]
+    public async Task OnUnknownUrnHookNeverAffectsAPoisonBody()
+    {
+        // The hook is for an unknown URN only (ADR-0037 "Configured strategy only"): with the DLQ on a poison record is
+        // written, with it off the poison takes the bounded retry -- the hook is never called and nothing is dropped as "handled".
+        var hook = 0;
+        var sent = new List<Sent>();
+        var on = ConsumerWith(Message(Encoding.UTF8.GetBytes("junk")).Object);
+        await new PulsarConsumer(
+            on.Object,
+            new Dictionary<string, BabelHandler>(),
+            new PulsarConsumerOptions
+            {
+                DeadLetterProducer = Dlq(sent).Object,
+                OnUnknownUrn = (_, _, _) => { hook++; return Task.CompletedTask; },
+            }).ReceiveAsync();
+        Assert.Equal("poison", Assert.Single(sent).DeadLetter.GetProperty("reason").GetString());
+        VerifyAcked(on, Times.Once());
+
+        var off = ConsumerWith(Message(Encoding.UTF8.GetBytes("junk")).Object);
+        await new PulsarConsumer(
+            off.Object,
+            new Dictionary<string, BabelHandler>(),
+            new PulsarConsumerOptions { OnUnknownUrn = (_, _, _) => { hook++; return Task.CompletedTask; } }).ReceiveAsync();
+        VerifyRedelivered(off, Times.Once());
+        VerifyAcked(off, Times.Never());
+
+        Assert.Equal(0, hook);
     }
 
     [Fact]
@@ -679,15 +708,17 @@ public sealed class PulsarSettleTests
     }
 
     [Fact]
-    public async Task PoisonWithDeadLetteringOffAndAnExhaustedCapDropsEvenOnTheVersionGate()
+    public async Task VersionGatedDeliveryWithDeadLetteringOffIsDroppedOnTheFirstDeliveryWithAttemptsLeft()
     {
-        var message = Message(Encoding.UTF8.GetBytes("{ nope"), 2, new Dictionary<string, string> { ["bq-schema-version"] = "9" });
+        // ADR-0037 decision 1 rule 3 (Pulsar): ack and drop, on the first delivery, with MaxAttempts nowhere near exhausted.
+        var message = Message(Encoding.UTF8.GetBytes("{ nope"), 0, new Dictionary<string, string> { ["bq-schema-version"] = "9" });
         var consumer = ConsumerWith(message.Object);
 
         await new PulsarConsumer(consumer.Object, new Dictionary<string, BabelHandler>()).ReceiveAsync();
 
         message.Verify(m => m.Value(), Times.Never);
         VerifyAcked(consumer, Times.Once());
+        VerifyRedelivered(consumer, Times.Never());
     }
 
     [Fact]

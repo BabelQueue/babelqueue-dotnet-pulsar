@@ -29,7 +29,7 @@ internal sealed class ConformanceSkip : Exception
 
 /// <summary>
 /// Every case of the Pulsar-scoped sections of the vendored conformance manifest (<c>pulsar</c>,
-/// <c>pulsar_exhaustion</c>, plus the core-scoped <c>poison_dlq</c> whose writer lives here), each runnable on its own,
+/// <c>pulsar_exhaustion</c>, <c>version_gate_pulsar</c>, plus the core-scoped <c>poison_dlq</c> whose writer lives here), each runnable on its own,
 /// plus the <c>results.json</c> writer of ADR-0032. Case ids follow <c>conformance/schema/results.schema.json</c>: a
 /// top-level <c>cases</c> array gives <c>&lt;name&gt;</c> (or <c>&lt;section&gt;#&lt;idx&gt;</c>), a sub-key with its own
 /// <c>cases</c> gives <c>&lt;sub-key&gt;/&lt;name&gt;</c> (or <c>&lt;sub-key&gt;/&lt;idx&gt;</c>), any other object sub-key is
@@ -115,6 +115,7 @@ internal static class PulsarConformanceSuite
             ("pulsar", "attempts_reconciliation") => () => AttemptsReconciliation(c),
             ("pulsar", "schema_version_gate") => () => SchemaVersionGate(sub!.Value.Value, c),
             ("pulsar_exhaustion", null) => () => Exhaustion(c),
+            ("version_gate_pulsar", null) => () => VersionGateSettle(body: Manifest.Value.GetProperty(section), c),
             ("poison_dlq", null) => () => PoisonDlq(c),
             _ => null,
         };
@@ -173,10 +174,12 @@ internal static class PulsarConformanceSuite
         await new PulsarConsumer(consumer.Object, handlers).ReceiveAsync();
 
         Require((expect == "decode" ? 1 : 0) == seen, $"expected {expect} but the handler ran {seen} time(s)");
-        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), expect == "decode" ? Times.Once() : Times.Never());
+        // A version-gated delivery (anything but "decode") is acknowledged and dropped on its first delivery (ADR-0037, no
+        // DLQ producer here); the exact version_gate_pulsar settle outcomes are asserted in VersionGateSettle.
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once());
         consumer.Verify(
             c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
-            expect == "decode" ? Times.Never() : Times.Once());
+            Times.Never());
     }
 
     // -- pulsar_exhaustion (ADR-0036 decisions 1 and 2) -------------------------------------------------------------
@@ -255,6 +258,70 @@ internal static class PulsarConformanceSuite
         }
 
         Require(kind != "poison" || handled == 0, "a poison body reached a handler");
+    }
+
+    // -- version_gate_pulsar (ADR-0037 decision 1) -----------------------------------------------------------------
+
+    private static async Task VersionGateSettle(JsonElement body, JsonElement testCase)
+    {
+        if (testCase.TryGetProperty("on_unknown_urn", out var strategy) && strategy.GetString() != "fail")
+        {
+            // The .NET Pulsar consumer has no unknown-URN strategy option: it behaves as `fail` (ADR-0037 "Strategy").
+            throw new ConformanceSkip("ADR-0037: rows with an on_unknown_urn value other than fail apply only to an SDK whose Pulsar consumer has the strategy option; the .NET consumer has none (it behaves as fail)");
+        }
+
+        var deadLetterOn = testCase.GetProperty("dead_letter").GetString() == "on";
+        var writeFails = testCase.TryGetProperty("dlq_write", out var w) && w.GetString() == "fails";
+        var expect = testCase.GetProperty("expect");
+        // This consumer's `off` means no DLQ writer exists, so outcome_no_writer (where present) is the expectation there.
+        var outcome = !deadLetterOn && expect.TryGetProperty("outcome_no_writer", out var nw)
+            ? nw.GetString()!
+            : expect.GetProperty("outcome").GetString()!;
+        var properties = new Dictionary<string, string> { ["bq-job"] = Urn, ["bq-schema-version"] = "2" };
+        if (testCase.TryGetProperty("bq_attempts", out var bq))
+        {
+            properties["bq-attempts"] = bq.GetString()!;
+        }
+
+        foreach (var incoming in body.GetProperty("incoming_bodies").EnumerateArray())
+        {
+            var name = incoming.GetProperty("name").GetString();
+            var bytes = Encoding.UTF8.GetBytes(incoming.GetProperty("body").GetString()!);
+            var consumer = ConsumerOf(MessageOf(bytes, 0, properties));
+            var sent = new List<(MessageMetadata Metadata, byte[] Payload)>();
+            var dlq = ProducerInto(sent, writeFails ? new InvalidOperationException("dlq down") : null);
+            var retry = ProducerInto(new List<(MessageMetadata Metadata, byte[] Payload)>(), null);
+            var handled = 0;
+            var unknown = 0;
+            var handlers = new Dictionary<string, BabelHandler> { [Urn] = (_, _, _) => { handled++; return Task.CompletedTask; } };
+            var options = new PulsarConsumerOptions
+            {
+                DeadLetterProducer = deadLetterOn ? dlq.Object : null,
+                RetryProducer = retry.Object,
+                OnUnknownUrn = (_, _, _) => { unknown++; return Task.CompletedTask; },
+            };
+            await new PulsarConsumer(consumer.Object, handlers, options).ReceiveAsync();
+
+            var acks = Invocations(consumer, nameof(IConsumer<byte[]>.Acknowledge));
+            var nacks = Invocations(consumer, nameof(IConsumer<byte[]>.RedeliverUnacknowledgedMessages));
+            Require(handled == 0 && unknown == 0, $"{name}: a version-gated delivery reached a handler or OnUnknownUrn");
+            Require(retry.Invocations.Count == 0, $"{name}: a version-gated delivery was retried");
+            switch (outcome)
+            {
+                case "ack":
+                    Require(acks == 1 && nacks == 0 && sent.Count == 0, $"{name}: ack: acked {acks}, nacked {nacks}, written {sent.Count}");
+                    break;
+                case "dlq_raw":
+                    Require(acks == 1 && nacks == 0 && sent.Count == 1, $"{name}: dlq_raw: acked {acks}, nacked {nacks}, written {sent.Count}");
+                    Require(sent[0].Payload.SequenceEqual(bytes), $"{name}: the DLQ record is not the incoming body byte for byte");
+                    break;
+                case "unsettled":
+                    Require(acks == 0 && nacks == 1, $"{name}: unsettled: acked {acks}, nacked {nacks}");
+                    break;
+                default:
+                    throw new ConformanceFailure($"unknown outcome {outcome}");
+            }
+        }
     }
 
     private static int Invocations(Mock<IConsumer<byte[]>> consumer, string method) =>
@@ -358,11 +425,17 @@ internal static class PulsarConformanceSuite
         return consumer;
     }
 
-    private static Mock<IProducer<byte[]>> ProducerInto(List<(MessageMetadata Metadata, byte[] Payload)> sent)
+    private static Mock<IProducer<byte[]>> ProducerInto(List<(MessageMetadata Metadata, byte[] Payload)> sent, Exception? failure = null)
     {
         var producer = new Mock<IProducer<byte[]>>();
-        producer
-            .Setup(p => p.Send(It.IsAny<MessageMetadata>(), It.IsAny<byte[]>(), It.IsAny<CancellationToken>()))
+        var setup = producer.Setup(p => p.Send(It.IsAny<MessageMetadata>(), It.IsAny<byte[]>(), It.IsAny<CancellationToken>()));
+        if (failure is not null)
+        {
+            setup.Callback<MessageMetadata, byte[], CancellationToken>((meta, payload, _) => sent.Add((meta, payload))).Throws(failure);
+            return producer;
+        }
+
+        setup
             .Callback<MessageMetadata, byte[], CancellationToken>((meta, payload, _) => sent.Add((meta, payload)))
             .Returns(new ValueTask<MessageId>(new MessageId(0, 0, 0, 0, "orders.dlq")));
         return producer;

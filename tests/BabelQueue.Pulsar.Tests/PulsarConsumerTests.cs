@@ -490,10 +490,11 @@ public sealed class PulsarConsumerTests
         Assert.Contains($"'{version}'", reported.Message);
         Assert.Null(reportedEnvelope!.Job);
         message.Verify(m => m.Value(), Times.Never);
+        // ADR-0037: dead-lettering off -> acknowledged and dropped on the first delivery, never redelivered.
         consumer.Verify(
             c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
-            Times.Once);
-        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Never);
+            Times.Never);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -509,7 +510,119 @@ public sealed class PulsarConsumerTests
         Assert.Equal(0, delivered);
         consumer.Verify(
             c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    private static Mock<IProducer<byte[]>> RecordingProducer(List<(MessageMetadata Metadata, byte[] Payload)> sent, Exception? failWith = null)
+    {
+        var producer = new Mock<IProducer<byte[]>>();
+        var setup = producer.Setup(p => p.Send(It.IsAny<MessageMetadata>(), It.IsAny<byte[]>(), It.IsAny<CancellationToken>()));
+        if (failWith is not null)
+        {
+            setup.Throws(failWith);
+        }
+        else
+        {
+            setup
+                .Callback<MessageMetadata, byte[], CancellationToken>((m, b, _) => sent.Add((m, b)))
+                .Returns(new ValueTask<MessageId>(new MessageId(0, 0, 0, 0, "orders.dlq")));
+        }
+
+        return producer;
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2)]
+    [InlineData(40)]
+    public async Task VersionGatedDeliveryWithDeadLetteringOnWritesTheRawBodyAndAcknowledgesOnTheFirstDelivery(int redeliveryCount)
+    {
+        // Not canonical (pretty-printed, escaped, odd key order): a decode + re-encode writer would change these bytes.
+        var body = Encoding.UTF8.GetBytes("{\n  \"meta\": {\"schema_version\": 2},\n  \"job\": \"" + Urn + "\", \"data\": {\"p\": \"a\\/b\", \"n\": 1.50}\n}\n");
+        var properties = new Dictionary<string, string> { ["bq-job"] = Urn, ["bq-schema-version"] = "2", ["bq-attempts"] = "9" };
+        var message = Message(redeliveryCount, body, properties);
+        var consumer = ConsumerWith(message.Object);
+        var sent = new List<(MessageMetadata Metadata, byte[] Payload)>();
+        var retried = new List<(MessageMetadata Metadata, byte[] Payload)>();
+        var delivered = 0;
+        var unknown = 0;
+        Exception? reported = null;
+        var options = new PulsarConsumerOptions
+        {
+            DeadLetterProducer = RecordingProducer(sent).Object,
+            RetryProducer = RecordingProducer(retried).Object,
+            OnUnknownUrn = (_, _, _) => { unknown++; return Task.CompletedTask; },
+            OnError = (e, _, _) => reported = e,
+        };
+
+        await new PulsarConsumer(consumer.Object, Handler(_ => delivered++), options).ReceiveAsync();
+
+        Assert.Equal(0, delivered);
+        Assert.Equal(0, unknown);
+        Assert.Empty(retried);
+        var record = Assert.Single(sent);
+        Assert.Equal(body, record.Payload);
+        Assert.DoesNotContain("dead_letter", Encoding.UTF8.GetString(record.Payload), StringComparison.Ordinal);
+        Assert.Contains("bq-schema-version", reported!.Message);
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+        consumer.Verify(
+            c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task VersionGatedDeliveryWithAFailingDeadLetterWriteStaysUnsettled()
+    {
+        var message = Message(0, Encoding.UTF8.GetBytes("not json"), new Dictionary<string, string> { ["bq-schema-version"] = "2" });
+        var consumer = ConsumerWith(message.Object);
+        var reported = new List<Exception>();
+        var options = new PulsarConsumerOptions
+        {
+            DeadLetterProducer = RecordingProducer(new List<(MessageMetadata Metadata, byte[] Payload)>(), new InvalidOperationException("down")).Object,
+            OnError = (e, _, _) => reported.Add(e),
+        };
+
+        await new PulsarConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), options).ReceiveAsync();
+
+        consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Never);
+        consumer.Verify(
+            c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
             Times.Once);
+        Assert.NotEmpty(reported);
+    }
+
+    [Fact]
+    public async Task VersionGatedDeliveryIgnoresTheOnUnknownUrnHookAndTheAttemptCap()
+    {
+        // A hook-only consumer (OnUnknownUrn set, no explicit strategy) behaves as `fail` for the version gate: the hook is
+        // never called and the delivery is not silently dropped as "handled" -- with the DLQ on it is written raw, and
+        // with the DLQ off it is acknowledged and dropped on the first delivery even with attempts left (MaxAttempts 5).
+        var unknown = 0;
+        var sent = new List<(MessageMetadata Metadata, byte[] Payload)>();
+        foreach (var deadLetterOn in new[] { true, false })
+        {
+            sent.Clear();
+            var body = Body();
+            var message = Message(0, body, new Dictionary<string, string> { ["bq-job"] = Urn, ["bq-schema-version"] = "2" });
+            var consumer = ConsumerWith(message.Object);
+            var options = new PulsarConsumerOptions
+            {
+                MaxAttempts = 5,
+                DeadLetterProducer = deadLetterOn ? RecordingProducer(sent).Object : null,
+                OnUnknownUrn = (_, _, _) => { unknown++; return Task.CompletedTask; },
+            };
+
+            await new PulsarConsumer(consumer.Object, Handler(_ => { }), options).ReceiveAsync();
+
+            Assert.Equal(deadLetterOn ? 1 : 0, sent.Count);
+            consumer.Verify(c => c.Acknowledge(It.IsAny<MessageId>(), It.IsAny<CancellationToken>()), Times.Once);
+            consumer.Verify(
+                c => c.RedeliverUnacknowledgedMessages(It.IsAny<IEnumerable<MessageId>>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        Assert.Equal(0, unknown);
     }
 
     [Fact]

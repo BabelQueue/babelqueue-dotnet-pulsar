@@ -16,7 +16,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>BabelQueue.Pulsar</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Authors>Muhammet Şafak</Authors>
     <Company>BabelQueue</Company>
     <Description>Apache Pulsar transport for BabelQueue — a canonical-envelope publisher and a URN-routed consumer over DotPulsar, on the framework-agnostic core.</Description>

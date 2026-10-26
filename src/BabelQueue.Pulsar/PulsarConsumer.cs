@@ -37,7 +37,7 @@ namespace BabelQueue.Pulsar;
 /// <para>
 /// <b>Poison route.</b> A body that cannot become a handled envelope — not valid UTF-8, not a JSON object, an object with
 /// no valid <c>job</c>/<c>urn</c> identity (ADR-0036 decision 4), any other non-conformant envelope
-/// (<see cref="EnvelopeCodec.Accepts"/>), or a message rejected by the <c>bq-schema-version</c> gate — is never handed to a
+/// (<see cref="EnvelopeCodec.Accepts"/>) — is never handed to a
 /// handler. With dead-lettering on it is written as the ADR-0035 record (<c>reason: "poison"</c>, the original bytes
 /// preserved) and acknowledged, <b>without a retry</b>; with dead-lettering off it takes the bounded retry above and is
 /// finally dropped. The original is acknowledged only after the dead-letter write succeeded; a failed write redelivers it.
@@ -47,7 +47,9 @@ namespace BabelQueue.Pulsar;
 /// decoded: when it is present and is not exactly the schema version the core supports
 /// (<see cref="EnvelopeCodec.SchemaVersion"/>, compared exactly as sent, as its canonical decimal string, with no
 /// trimming — so <c>"2"</c>, <c>"x"</c>, <c>"01"</c> and <c>" 1"</c> are all unknown), the body is never decoded or routed;
-/// <c>OnError</c> is notified (with an empty, undecoded envelope) and the message takes the poison route. A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR) property changes nothing, and a
+/// <c>OnError</c> is notified (with an empty, undecoded envelope) and the message is settled on its <b>first delivery</b> (ADR-0037 decision 1):
+/// with dead-lettering on the body is written <b>exactly as received</b> (no <c>dead_letter</c> block) to the dead-letter topic and acknowledged after the write
+/// (a failed write leaves it unacknowledged); with dead-lettering off it is acknowledged and dropped. It is never retried and never reaches a handler or <c>OnUnknownUrn</c>. A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR) property changes nothing, and a
 /// <c>"1"</c> property still goes through the post-decode <see cref="EnvelopeCodec.Accepts"/> check.
 /// </para>
 /// </summary>
@@ -154,10 +156,10 @@ public sealed class PulsarConsumer : IAsyncDisposable
                 EnvelopeCodec.SchemaVersion.ToString(CultureInfo.InvariantCulture),
                 StringComparison.Ordinal))
         {
-            // The body is deliberately not decoded, so hand OnError an empty envelope. The message takes the
-            // poison route (ADR-0036 decision 2): a retry cannot change a version verdict, and with dead-lettering
-            // on the original bytes are parked in the DLQ.
-            await SettlePoisonAsync(
+            // ADR-0037 decision 1: settled on the first delivery, whatever bq-attempts / RedeliveryCount / MaxAttempts say.
+            // The body is deliberately not decoded, so hand OnError an empty envelope. The consumer has no
+            // unknown-URN strategy option (it behaves as `fail`) and the OnUnknownUrn hook never applies here.
+            await SettleVersionGatedAsync(
                 message,
                 Reconcile(new Envelope(null, null, null, null, 0, null), attemptsProperty, message.RedeliveryCount),
                 new BabelQueueException(
@@ -297,6 +299,37 @@ public sealed class PulsarConsumer : IAsyncDisposable
         {
             DropExhausted(message, envelope, reason, counted);
             await AcknowledgeAsync(message, cancellationToken).ConfigureAwait(false);
+        }
+
+        Report(cause, envelope, message);
+    }
+
+    /// <summary>
+    /// ADR-0037 decision 1 (broker-bindings §5.7): a version-gated delivery is never decoded, never retried and never
+    /// handed to a handler or the <see cref="PulsarConsumerOptions.OnUnknownUrn"/> hook. With dead-lettering on
+    /// (<see cref="PulsarConsumerOptions.DeadLetterProducer"/> set) the body is written <b>exactly as received</b>, byte for
+    /// byte, to the dead-letter topic (no <c>dead_letter</c> block, no re-encoding) and the message is acknowledged only after
+    /// the write succeeded; a failed write leaves it unacknowledged (negative acknowledgement) and is reported. With
+    /// dead-lettering off it is acknowledged and dropped (a trace warning). This consumer has no unknown-URN strategy
+    /// option, so it behaves as the `fail` strategy.
+    /// </summary>
+    private async Task SettleVersionGatedAsync(
+        IMessage<byte[]> message, Envelope envelope, Exception cause, CancellationToken cancellationToken)
+    {
+        if (_deadLetterProducer is null)
+        {
+            Trace.TraceWarning(
+                $"BabelQueue.Pulsar: dropped a message from '{QueueName(message)}' on its first delivery: "
+                + $"unsupported {SchemaVersionProperty} property; dead-lettering is off.");
+            await AcknowledgeAsync(message, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await DeadLetterOrRedeliverAsync(
+                message,
+                () => (PulsarProperties.Copy(message.Properties), message.Value() ?? Array.Empty<byte>()),
+                envelope,
+                cancellationToken).ConfigureAwait(false);
         }
 
         Report(cause, envelope, message);
