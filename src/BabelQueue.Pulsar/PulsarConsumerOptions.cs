@@ -58,6 +58,16 @@ public sealed class PulsarConsumerOptions
     public IProducer<byte[]>? DeadLetterProducer { get; set; }
 
     /// <summary>
+    /// Optional dead-letter observer (ADR-0039 section 5.1), called once per message the consumer wrote to the
+    /// <see cref="DeadLetterProducer"/>, right after the write is confirmed: an exhausted <c>failed</c> or
+    /// <c>unknown_urn</c> message, a poison body, or a raw message rejected by the schema-version gate (empty reason).
+    /// Not called when the write fails (the message is redelivered), for a retry, or when dead-lettering is off. An
+    /// observer exception is caught and logged; it never changes the settle outcome. Needs a <c>BabelQueue.Core</c>
+    /// that ships <see cref="IDeadLetterObserver"/>.
+    /// </summary>
+    public IDeadLetterObserver? DeadLetterObserver { get; set; }
+
+    /// <summary>
     /// A producer bound to the consumer's own topic, used to retry a failed message the Go way (broker-bindings §5.5): the
     /// message is re-published with <c>bq-attempts</c> + 1 (and the body's <c>attempts</c> in sync) and the original is
     /// acknowledged. The attempt count then travels with the message, so <see cref="MaxAttempts"/> bounds the retries on

@@ -293,6 +293,8 @@ public sealed class PulsarConsumer : IAsyncDisposable
                     return (properties, Encoding.UTF8.GetBytes(EnvelopeCodec.Encode(annotated)));
                 },
                 envelope,
+                reason,
+                envelope,
                 cancellationToken).ConfigureAwait(false);
         }
         else
@@ -329,6 +331,8 @@ public sealed class PulsarConsumer : IAsyncDisposable
                 message,
                 () => (PulsarProperties.Copy(message.Properties), message.Value() ?? Array.Empty<byte>()),
                 envelope,
+                string.Empty, // a raw body: no dead_letter block, so no reason
+                null,         // never decoded: no meta.queue
                 cancellationToken).ConfigureAwait(false);
         }
 
@@ -363,6 +367,8 @@ public sealed class PulsarConsumer : IAsyncDisposable
                 return (PulsarProperties.Copy(message.Properties), record);
             },
             envelope,
+            "poison",
+            null, // the body is not a trustworthy envelope: the source queue is the consumed topic
             cancellationToken).ConfigureAwait(false);
         Report(cause, envelope, message);
     }
@@ -428,11 +434,17 @@ public sealed class PulsarConsumer : IAsyncDisposable
     /// <summary>
     /// Writes the dead-letter message and acknowledges the original only after that succeeded; a failed write leaves the
     /// original unacknowledged (negative ack, so it is redelivered and the write is tried again) and is reported.
+    /// The dead-letter observer (ADR-0039 section 5.1) is told once, right after the confirmed write, with
+    /// <paramref name="reason"/> (empty for a raw version-gated body); a failed write never reaches it.
+    /// <paramref name="queueSource"/> is the envelope whose <c>meta.queue</c> names the source queue, or <c>null</c>
+    /// when the body is not a decoded envelope (the consumed topic is used).
     /// </summary>
     private async Task DeadLetterOrRedeliverAsync(
         IMessage<byte[]> message,
         Func<(IReadOnlyDictionary<string, string> Properties, byte[] Payload)> build,
         Envelope envelope,
+        string reason,
+        Envelope? queueSource,
         CancellationToken cancellationToken)
     {
         Exception? writeError = null;
@@ -456,6 +468,11 @@ public sealed class PulsarConsumer : IAsyncDisposable
 
         if (writeError is null)
         {
+            var metaQueue = queueSource?.Meta?.Queue;
+            _options.DeadLetterObserver.NotifySafely(new DeadLetterEvent(
+                string.IsNullOrWhiteSpace(metaQueue) ? QueueName(message) : metaQueue,
+                _deadLetterProducer!.Topic,
+                reason));
             await AcknowledgeAsync(message, cancellationToken).ConfigureAwait(false);
             return;
         }
