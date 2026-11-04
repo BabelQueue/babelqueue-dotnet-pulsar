@@ -774,4 +774,201 @@ public sealed class PulsarSettleTests
 
         Assert.Equal("poison", Assert.Single(sent).DeadLetter.GetProperty("reason").GetString());
     }
+
+    // -- dead-letter observer (ADR-0039 section 5.1-5.3) ----------------------------------------------------------
+
+    private sealed class RecordingObserver : IDeadLetterObserver
+    {
+        public List<DeadLetterEvent> Events { get; } = new();
+
+        public void OnDeadLetter(DeadLetterEvent deadLetterEvent) => Events.Add(deadLetterEvent);
+    }
+
+    private sealed class ThrowingObserver : IDeadLetterObserver
+    {
+        public int Calls { get; private set; }
+
+        public void OnDeadLetter(DeadLetterEvent deadLetterEvent)
+        {
+            Calls++;
+            throw new InvalidOperationException("observer exploded");
+        }
+    }
+
+    private const string DlqTopic = "persistent://public/default/orders.dlq";
+
+    [Fact]
+    public async Task ObserverIsCalledOnceWhenAFailingHandlerExhaustsItsAttempts()
+    {
+        var sent = new List<Sent>();
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(Message(Body(), 2).Object);
+
+        await new PulsarConsumer(consumer.Object, Failing(), new PulsarConsumerOptions
+        {
+            DeadLetterProducer = Dlq(sent).Object,
+            DeadLetterObserver = observer,
+        }).ReceiveAsync();
+
+        Assert.Single(sent);
+        Assert.Equal(new DeadLetterEvent("orders", DlqTopic, "failed"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAnUnknownUrnOnTheLastDelivery()
+    {
+        var sent = new List<Sent>();
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(Message(Body(), 2).Object);
+
+        await new PulsarConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new PulsarConsumerOptions
+        {
+            DeadLetterProducer = Dlq(sent).Object,
+            DeadLetterObserver = observer,
+        }).ReceiveAsync();
+
+        Assert.Single(sent);
+        Assert.Equal(new DeadLetterEvent("orders", DlqTopic, "unknown_urn"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAPoisonBody()
+    {
+        var sent = new List<Sent>();
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(Message(Encoding.UTF8.GetBytes("not json at all")).Object);
+
+        await new PulsarConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new PulsarConsumerOptions
+        {
+            DeadLetterProducer = Dlq(sent).Object,
+            DeadLetterObserver = observer,
+        }).ReceiveAsync();
+
+        Assert.Single(sent);
+        Assert.Equal(new DeadLetterEvent("orders", DlqTopic, "poison"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAVersionGatedRawBodyWithAnEmptyReason()
+    {
+        var sent = new List<Sent>();
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(Message(Body(), 0, new Dictionary<string, string>
+        {
+            ["bq-job"] = Urn,
+            ["bq-schema-version"] = "2",
+        }).Object);
+
+        await new PulsarConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new PulsarConsumerOptions
+        {
+            DeadLetterProducer = Dlq(sent).Object,
+            DeadLetterObserver = observer,
+        }).ReceiveAsync();
+
+        Assert.Single(sent);
+        Assert.Equal(new DeadLetterEvent("orders", DlqTopic, string.Empty), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverQueueIsMetaQueueWhenTheEnvelopeCarriesOne()
+    {
+        var env = EnvelopeCodec.Make(Urn, new Dictionary<string, object?> { ["order_id"] = 1 }, "billing", null);
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(Message(Encoding.UTF8.GetBytes(EnvelopeCodec.Encode(env)), 2).Object);
+
+        await new PulsarConsumer(consumer.Object, Failing(), new PulsarConsumerOptions
+        {
+            DeadLetterProducer = Dlq(new List<Sent>()).Object,
+            DeadLetterObserver = observer,
+        }).ReceiveAsync();
+
+        Assert.Equal("billing", Assert.Single(observer.Events).Queue);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledForARetryBelowTheCap()
+    {
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(Message(Body()).Object);
+
+        await new PulsarConsumer(consumer.Object, Failing(), new PulsarConsumerOptions
+        {
+            DeadLetterProducer = Dlq(new List<Sent>()).Object,
+            DeadLetterObserver = observer,
+        }).ReceiveAsync();
+
+        Assert.Empty(observer.Events);
+        VerifyRedelivered(consumer, Times.Once());
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenDeadLetteringIsOff()
+    {
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(Message(Encoding.UTF8.GetBytes("junk")).Object);
+
+        await new PulsarConsumer(consumer.Object, Failing(), new PulsarConsumerOptions
+        {
+            MaxAttempts = 1,
+            DeadLetterObserver = observer,
+        }).ReceiveAsync();
+
+        Assert.Empty(observer.Events);
+        VerifyAcked(consumer, Times.Once());
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenTheDeadLetterWriteFails()
+    {
+        var observer = new RecordingObserver();
+        var failing = Dlq(new List<Sent>(), new InvalidOperationException("broker down")).Object;
+
+        foreach (var message in new[]
+                 {
+                     Message(Body(), 2),
+                     Message(Encoding.UTF8.GetBytes("junk")),
+                     Message(Body(), 0, new Dictionary<string, string> { ["bq-schema-version"] = "2" }),
+                 })
+        {
+            var consumer = ConsumerWith(message.Object);
+
+            await new PulsarConsumer(consumer.Object, Failing(), new PulsarConsumerOptions
+            {
+                DeadLetterProducer = failing,
+                DeadLetterObserver = observer,
+            }).ReceiveAsync();
+
+            VerifyAcked(consumer, Times.Never());
+            VerifyRedelivered(consumer, Times.Once());
+        }
+
+        Assert.Empty(observer.Events);
+    }
+
+    [Fact]
+    public async Task AThrowingObserverDoesNotChangeTheSettleOutcome()
+    {
+        foreach (var message in new[]
+                 {
+                     Message(Body(), 2),
+                     Message(Encoding.UTF8.GetBytes("junk")),
+                     Message(Body(), 0, new Dictionary<string, string> { ["bq-schema-version"] = "2" }),
+                 })
+        {
+            var sent = new List<Sent>();
+            var observer = new ThrowingObserver();
+            var consumer = ConsumerWith(message.Object);
+
+            await new PulsarConsumer(consumer.Object, Failing(), new PulsarConsumerOptions
+            {
+                DeadLetterProducer = Dlq(sent).Object,
+                DeadLetterObserver = observer,
+            }).ReceiveAsync();
+
+            Assert.Equal(1, observer.Calls);
+            Assert.Single(sent);
+            VerifyAcked(consumer, Times.Once());
+            VerifyRedelivered(consumer, Times.Never());
+        }
+    }
 }

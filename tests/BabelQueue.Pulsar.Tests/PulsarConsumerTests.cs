@@ -667,4 +667,41 @@ public sealed class PulsarConsumerTests
 
         consumer.Verify(c => c.Receive(It.IsAny<CancellationToken>()), Times.AtLeastOnce);
     }
+
+    [Fact]
+    public async Task HandlerReceivesThePublishedTraceparentThroughTheConsumer()
+    {
+        const string traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        MessageMetadata? meta = null;
+        byte[]? body = null;
+        var producer = new Mock<IProducer<byte[]>>();
+        producer.SetupGet(p => p.Topic).Returns("orders");
+        producer
+            .Setup(p => p.Send(It.IsAny<MessageMetadata>(), It.IsAny<byte[]>(), It.IsAny<CancellationToken>()))
+            .Callback<MessageMetadata, byte[], CancellationToken>((m, b, _) => { meta = m; body = b; })
+            .Returns(new ValueTask<MessageId>(new MessageId(0, 0, 0, 0, "orders")));
+        await new PulsarPublisher(producer.Object).PublishWithHeadersAsync(
+            Urn, null, new Dictionary<string, string> { ["traceparent"] = traceparent }, "trace-1");
+
+        var message = Message(0, body!, new Dictionary<string, string>
+        {
+            ["bq-job"] = meta!["bq-job"]!,
+            ["traceparent"] = meta["traceparent"]!,
+        });
+        IReadOnlyDictionary<string, string>? seen = null;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, received, _) =>
+            {
+                seen = PulsarTraceHeaders.Extract(received);
+                return Task.CompletedTask;
+            },
+        };
+
+        await new PulsarConsumer(ConsumerWith(message.Object).Object, handlers).ReceiveAsync();
+
+        Assert.NotNull(seen);
+        Assert.Equal(traceparent, seen!["traceparent"]);
+        Assert.DoesNotContain("bq-job", seen.Keys);
+    }
 }
