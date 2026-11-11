@@ -63,6 +63,32 @@ public sealed class PulsarPublisher
         CancellationToken cancellationToken = default)
     {
         var envelope = EnvelopeCodec.Make(urn, data, TopicName(_producer.Topic), traceId);
+        return await PublishEnvelopeAsync(envelope, headers, delay, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Sends an <b>already-built</b> <paramref name="envelope"/> exactly as given (the same §5 property projection,
+    /// header overlay and delayed delivery as <see cref="PublishWithHeadersAsync"/>) without rebuilding it:
+    /// <c>meta.id</c>, <c>trace_id</c> and every extension field reach the wire unchanged. Use it as the <c>send</c>
+    /// callback of <c>Telemetry.PublishAsync(..., headers, env =&gt; publisher.PublishEnvelopeAsync(env, headers), queue)</c>,
+    /// so the producer span's <c>messaging.message.id</c> is the <c>meta.id</c> on the wire. Returns <c>meta.id</c>.
+    /// </summary>
+    /// <param name="envelope">The envelope to send; its <c>meta.queue</c> is the caller's responsibility.</param>
+    /// <remarks>
+    /// <c>meta.queue</c> is whatever the envelope carries; it is not rewritten to this publisher's target. An envelope
+    /// built by <c>Telemetry.PublishAsync</c> carries that call's <c>queue</c> argument (default <c>"default"</c>), so pass
+    /// the queue/topic name there, or the wire <c>meta.queue</c> and the span's destination will not name it.
+    /// </remarks>
+    /// <param name="headers">The out-of-band transport headers to ride beside the envelope.</param>
+    /// <param name="delay">A positive delay schedules native delayed delivery.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<string> PublishEnvelopeAsync(
+        Envelope envelope,
+        IReadOnlyDictionary<string, string>? headers = null,
+        TimeSpan? delay = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
 
         var metadata = new MessageMetadata();
         var properties = new Dictionary<string, string>(PulsarProperties.Of(envelope), StringComparer.Ordinal);
