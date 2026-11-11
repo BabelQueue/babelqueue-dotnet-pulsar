@@ -125,6 +125,25 @@ await using var babel = new PulsarConsumer(consumer, handlers, new PulsarConsume
 first `await` escapes the consumer's try/catch and can crash the process. Keep hooks
 synchronous, or hand async work off yourself and observe its failures.
 
+## Tracing a publish (ADR-0028, ADR-0038)
+
+`PublishEnvelopeAsync(envelope, headers, ...)` sends an **already-built** envelope exactly as given (the same
+§5 property projection, header overlay and delayed delivery as `PublishWithHeadersAsync`, no rebuild). Use it as the `send` callback of
+`BabelQueue.Core`'s `Telemetry.PublishAsync`, so the producer span's `messaging.message.id` is the `meta.id` that
+reaches the wire and the span's `traceparent` rides beside the envelope:
+
+```csharp
+using BabelQueue.Tracing;
+
+var headers = new Dictionary<string, string>();
+await Telemetry.PublishAsync("urn:babel:orders:created", data, headers,
+    env => publisher.PublishEnvelopeAsync(env, headers), "orders", Telemetry.Systems.Pulsar);
+```
+
+The `queue` argument you give `Telemetry.PublishAsync` becomes `meta.queue`; `PublishEnvelopeAsync` does not change
+the envelope. The envelope is unchanged (`schema_version` stays `1`). Needs no `BabelQueue.Core` newer than the
+one this package already requires.
+
 ## Build & test
 
 ```bash
